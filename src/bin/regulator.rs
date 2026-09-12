@@ -1,240 +1,23 @@
 //! Execution-quality regulator for HyperCore perps.
 //!
-//! Benchmarks every HyperCore fill against the tightest bid/ask across
-//! Binance, Bybit and OKX at the instant the fill was observed, and runs the
-//! DFBA "mispricing clock": what fraction of the time HL's mid sits more than
-//! k bps from the CEX composite mid.
+//! Benchmarks every HyperCore fill against Binance/Bybit/OKX USDT perps at the
+//! fill's own timestamp, and runs the DFBA "mispricing clock": what fraction
+//! of the time HL's mid sits more than k bps from the CEX composite mid.
 //!
-//! Clock discipline (this is the whole game):
-//!   * every event stores exch_ts (the venue's own ms clock) AND recv_ts
-//!     (local monotonic at frame arrival)
-//!   * the fill <-> reference join is done on recv_ts ONLY - one clock
-//!   * per-feed `recv_wall - exch_ts` is reported so you can see how stale the
-//!     reference is; it includes network delay and clock skew and is NOT
-//!     subtracted, because it cannot be separated from skew
+//! Clock discipline:
+//!   * effective half-spread is fill vs HL's own mid: one clock, HL's
+//!   * basis and mispricing use each venue's latest quote with exch_ts <= T:
+//!     a cross-clock join that holds only while the venues' clocks agree;
+//!     `recv_wall - exch_ts` per feed is printed as the evidence
+//!   * HL's feed arrives ~300 ms after the CEX feeds. That is HL's speedbump,
+//!     not skew, and it is why the join is on exchange time, not receive time
 //!
 //! Usage:  regulator [--coin BTC] [--secs 120] [--hl-fee-bps 7.0]
 //!                   [--cex-fee-bps 2.0] [--csv fills.csv]
 
-use std::{
-    collections::VecDeque,
-    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
-};
+use std::collections::VecDeque;
 
-use futures_util::{SinkExt, StreamExt};
-use serde_json::{json, Value};
-use tokio::sync::mpsc;
-use tokio_tungstenite::{connect_async, tungstenite::Message};
-
-#[derive(Clone, Copy, Debug)]
-struct Quote {
-    bid: f64,
-    ask: f64,
-    exch_ms: u64,
-    recv_wall_ms: u64,
-}
-
-#[derive(Debug)]
-enum Ev {
-    Cex { venue: &'static str, q: Quote },
-    HlBbo(Quote),
-    HlTrade { px: f64, sz: f64, buy: bool, exch_ms: u64 },
-}
-
-fn wall_ms() -> u64 {
-    SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_millis() as u64).unwrap_or(0)
-}
-
-fn f(v: &Value) -> f64 {
-    v.as_str().and_then(|s| s.parse().ok()).or_else(|| v.as_f64()).unwrap_or(0.0)
-}
-
-async fn feed(url: String, sub: Option<String>, tx: mpsc::Sender<Ev>, parse: fn(&Value, Instant) -> Vec<Ev>) {
-    loop {
-        match connect_async(&url).await {
-            Ok((mut ws, _)) => {
-                if let Some(s) = &sub {
-                    let _ = ws.send(Message::Text(s.clone().into())).await;
-                }
-                while let Some(Ok(m)) = ws.next().await {
-                    let recv = Instant::now();
-                    let text = match m {
-                        Message::Text(t) => t.to_string(),
-                        Message::Ping(p) => {
-                            let _ = ws.send(Message::Pong(p)).await;
-                            continue;
-                        }
-                        _ => continue,
-                    };
-                    if let Ok(v) = serde_json::from_str::<Value>(&text) {
-                        for e in parse(&v, recv) {
-                            if tx.send(e).await.is_err() {
-                                return;
-                            }
-                        }
-                    }
-                }
-            }
-            Err(e) => eprintln!("ws {url}: {e}"),
-        }
-        tokio::time::sleep(Duration::from_secs(2)).await;
-    }
-}
-
-fn parse_binance(v: &Value, _recv: Instant) -> Vec<Ev> {
-    if v.get("b").is_none() {
-        return vec![];
-    }
-    vec![Ev::Cex {
-        venue: "binance",
-        q: Quote { bid: f(&v["b"]), ask: f(&v["a"]), exch_ms: v["T"].as_u64().unwrap_or(0), recv_wall_ms: wall_ms() },
-    }]
-}
-
-fn parse_bybit(v: &Value, _recv: Instant) -> Vec<Ev> {
-    let d = &v["data"];
-    let bid = d["b"].get(0).map(|l| f(&l[0])).unwrap_or(0.0);
-    let ask = d["a"].get(0).map(|l| f(&l[0])).unwrap_or(0.0);
-    if bid == 0.0 && ask == 0.0 {
-        return vec![];
-    }
-    vec![Ev::Cex {
-        venue: "bybit",
-        q: Quote { bid, ask, exch_ms: v["ts"].as_u64().unwrap_or(0), recv_wall_ms: wall_ms() },
-    }]
-}
-
-fn parse_okx(v: &Value, _recv: Instant) -> Vec<Ev> {
-    let Some(d) = v["data"].get(0) else { return vec![] };
-    let bid = d["bids"].get(0).map(|l| f(&l[0])).unwrap_or(0.0);
-    let ask = d["asks"].get(0).map(|l| f(&l[0])).unwrap_or(0.0);
-    if bid == 0.0 || ask == 0.0 {
-        return vec![];
-    }
-    vec![Ev::Cex {
-        venue: "okx",
-        q: Quote { bid, ask, exch_ms: f(&d["ts"]) as u64, recv_wall_ms: wall_ms() },
-    }]
-}
-
-fn parse_hl(v: &Value, _recv: Instant) -> Vec<Ev> {
-    match v["channel"].as_str() {
-        Some("bbo") => {
-            let d = &v["data"];
-            let (Some(b), Some(a)) = (d["bbo"].get(0), d["bbo"].get(1)) else { return vec![] };
-            vec![Ev::HlBbo(Quote {
-                bid: f(&b["px"]), ask: f(&a["px"]), exch_ms: d["time"].as_u64().unwrap_or(0), recv_wall_ms: wall_ms(),
-            })]
-        }
-        Some("trades") => v["data"]
-            .as_array()
-            .map(|arr| {
-                arr.iter()
-                    .map(|t| Ev::HlTrade {
-                        px: f(&t["px"]),
-                        sz: f(&t["sz"]),
-                        buy: t["side"].as_str() == Some("B"),
-                        exch_ms: t["time"].as_u64().unwrap_or(0),
-                    })
-                    .collect()
-            })
-            .unwrap_or_default(),
-        _ => vec![],
-    }
-}
-
-/// Per-venue quote history keyed by the venue's own timestamp.
-///
-/// The reference at fill time T is built from each venue's latest quote with
-/// exch_ts <= T. This is a CROSS-CLOCK join and is only valid because the
-/// exchanges' clocks agree with each other to a few tens of ms - the
-/// per-venue `recv_wall - exch_ts` printed at the end is the evidence; if
-/// those numbers drift apart, the join is wrong. Joining on local receive
-/// time instead is single-clock but compares a fill against CEX state that
-/// is ~300 ms NEWER, because HL's WebSocket delivers later than the CEXs'.
-///
-/// Composite mid is the MEDIAN of venue mids; the CEX spread is the tightest
-/// SINGLE-venue spread. A cross-venue max-bid/min-ask composite crosses
-/// itself whenever quotes are a few ms apart and yields negative spreads.
-#[derive(Default)]
-struct Ref {
-    hist: [VecDeque<Quote>; 3],
-    lag: [VecDeque<f64>; 3],
-}
-
-const VENUES: [&str; 3] = ["binance", "bybit", "okx"];
-
-struct RefPoint {
-    mid: f64,
-    half_spread_bps: f64,
-    venues: usize,
-}
-
-impl Ref {
-    fn set(&mut self, venue: &str, q: Quote) {
-        let i = VENUES.iter().position(|v| *v == venue).unwrap();
-        let h = &mut self.hist[i];
-        h.push_back(q);
-        if h.len() > 400 {
-            h.pop_front();
-        }
-        let l = &mut self.lag[i];
-        l.push_back(q.recv_wall_ms as f64 - q.exch_ms as f64);
-        if l.len() > 2000 {
-            l.pop_front();
-        }
-    }
-
-    fn at(&self, t_ms: u64, max_age_ms: u64) -> Option<RefPoint> {
-        let mut mids = Vec::with_capacity(3);
-        let mut best_half = f64::MAX;
-        for h in &self.hist {
-            if let Some(q) = h.iter().rev().find(|q| q.exch_ms <= t_ms) {
-                if t_ms - q.exch_ms <= max_age_ms && q.bid > 0.0 && q.ask > q.bid {
-                    let mid = (q.bid + q.ask) / 2.0;
-                    mids.push(mid);
-                    best_half = best_half.min((q.ask - q.bid) / mid / 2.0 * 1e4);
-                }
-            }
-        }
-        if mids.is_empty() {
-            return None;
-        }
-        mids.sort_by(|a, b| a.partial_cmp(b).unwrap());
-        Some(RefPoint { mid: mids[mids.len() / 2], half_spread_bps: best_half, venues: mids.len() })
-    }
-}
-
-/// HL's own BBO history on HL's clock, so effective spread is single-clock.
-#[derive(Default)]
-struct HlBook {
-    hist: VecDeque<Quote>,
-}
-
-impl HlBook {
-    fn set(&mut self, q: Quote) {
-        self.hist.push_back(q);
-        if self.hist.len() > 400 {
-            self.hist.pop_front();
-        }
-    }
-    fn mid_at(&self, t_ms: u64) -> Option<f64> {
-        self.hist.iter().rev().find(|q| q.exch_ms <= t_ms).map(|q| (q.bid + q.ask) / 2.0)
-    }
-}
-
-fn pct(v: &mut [f64], p: f64) -> f64 {
-    if v.is_empty() {
-        return f64::NAN;
-    }
-    v.sort_by(|a, b| a.partial_cmp(b).unwrap());
-    v[((v.len() - 1) as f64 * p).round() as usize]
-}
-
-fn arg(name: &str, default: &str) -> String {
-    let a: Vec<String> = std::env::args().collect();
-    a.iter().position(|x| x == name).and_then(|i| a.get(i + 1).cloned()).unwrap_or(default.into())
-}
+use hl_blockscope::feeds::{arg, deadline, pct, spawn, Ev, HlBook, Ref, VENUES};
 
 #[tokio::main]
 async fn main() {
@@ -244,28 +27,7 @@ async fn main() {
     let cex_fee: f64 = arg("--cex-fee-bps", "2.0").parse().unwrap(); // ~VIP taker
     let csv = arg("--csv", "");
     let sym = coin.to_uppercase();
-
-    let (tx, mut rx) = mpsc::channel::<Ev>(4096);
-    tokio::spawn(feed(
-        format!("wss://fstream.binance.com/ws/{}usdt@bookTicker", sym.to_lowercase()),
-        None, tx.clone(), parse_binance,
-    ));
-    tokio::spawn(feed(
-        "wss://stream.bybit.com/v5/public/linear".into(),
-        Some(json!({"op":"subscribe","args":[format!("orderbook.1.{sym}USDT")]}).to_string()),
-        tx.clone(), parse_bybit,
-    ));
-    tokio::spawn(feed(
-        "wss://ws.okx.com:8443/ws/v5/public".into(),
-        Some(json!({"op":"subscribe","args":[{"channel":"bbo-tbt","instId":format!("{sym}-USDT-SWAP")}]}).to_string()),
-        tx.clone(), parse_okx,
-    ));
-    for sub in ["trades", "bbo"] {
-        let tx = tx.clone();
-        let s = json!({"method":"subscribe","subscription":{"type":sub,"coin":sym}}).to_string();
-        tokio::spawn(async move { feed("wss://api.hyperliquid.xyz/ws".into(), Some(s), tx, parse_hl).await });
-    }
-    drop(tx);
+    let mut rx = spawn(&sym, true);
 
     let mut r = Ref::default();
     let mut hl = HlBook::default();
@@ -296,7 +58,7 @@ async fn main() {
     }
 
     let max_age_ms = 1500u64;
-    let deadline = Instant::now() + Duration::from_secs(secs);
+    let deadline = deadline(secs);
     eprintln!("regulator {sym}: collecting for {secs}s ...");
 
     while let Ok(Some(ev)) = tokio::time::timeout_at(deadline.into(), rx.recv()).await {
@@ -331,8 +93,9 @@ async fn main() {
                     basis_all.push(dev);
                 }
             }
-            Ev::HlTrade { px, sz, buy, exch_ms } => {
-                let (Some(rp), Some(hm)) = (r.at(exch_ms, max_age_ms), hl.mid_at(exch_ms)) else {
+            Ev::HlTrade(t) => {
+                let (px, sz, buy, exch_ms) = (t.px, t.sz, t.buy, t.exch_ms);
+                let (Some(rp), Some(hm)) = (r.at(exch_ms, max_age_ms), hl.mid_before(exch_ms)) else {
                     skipped += 1;
                     continue;
                 };

@@ -84,3 +84,37 @@ How the reference is built: for a fill at HL time T, take each venue's latest qu
 This is a cross-clock join. It holds only while the venues' clocks agree. The tool prints `recv_wall - exch_ts` per feed as evidence; if those drift apart, the reference is wrong. The effective half-spread is HL-vs-HL and does not depend on it.
 
 Sample, BTC, 120s: effective half-spread p50 0.06 bps, CEX tightest half-spread 0.01 bps, HL mid within 1 bps of CEX 98.7% of the time after basis adjustment (mean 0.14 bps). Beat rate on all-in cost is 0% at tier-0 fees: 7 bps taker on HL vs ~2 bps on a CEX VIP tier. The spread is a wash; the fee is the whole difference.
+
+Reference clocks: HL's feed arrives ~300 ms after the CEX feeds. That is HL's speedbump, not clock error, and it is why the join is on exchange time rather than receive time.
+
+The effective half-spread uses the last bbo strictly *before* the fill's timestamp. The bbo stamped with the fill's own millisecond is the post-trade state of that block: a sweep that exhausts a level and rests its remainder moves the touch in the same millisecond, and joining on it puts fills on the wrong side of the mid.
+
+## classifier: who is trading against whom
+
+Third binary. The public `trades` feed carries both counterparties, so every fill can be attributed. Each address is measured by what HL's mid did after its fills.
+
+```
+cargo run --release --bin classifier -- --coin BTC --secs 600 --csv fills.csv
+```
+
+Flags: `--coin`, `--secs`, `--min-fills` (orders needed to classify, default 5), `--pickoff-bps` (default 0.5), `--top`, `--csv`.
+
+Unit of observation is the **order**, not the fill. A sweep that hits 43 resting orders in one millisecond is one decision with one markout; counting it 43 times inflates every t-stat. Taker observations are grouped by (taker, ms); maker observations by (maker, ms, taker).
+
+| metric | definition |
+|---|---|
+| markout (taker view) | side × (mid at t+h / pre-trade mid − 1), h = 100 ms, 1 s, 5 s. HL mid vs HL mid, HL's clock. |
+| eff / captd | half-spread the taker paid = half-spread the maker captured |
+| realised spread | captured − markout: what the maker actually kept at horizon h |
+| pickoff | share of a maker's hits where the taker's 1 s markout exceeded the threshold |
+| preCEX | CEX composite move in the taker's direction over the 500 ms before the fill. Cross-clock; the latency-arb signature. |
+
+Classes: `twap` if most of an address's orders carry a zero tx hash (HL TWAP sub-orders; they land on an exact 30 s cadence and mark out at ~0); `informed` if mean 1 s markout > 0 with t-stat > 2 over orders; `natural` otherwise; `thin` below `--min-fills`. The volume decomposition crosses taker class with whether the resting side belongs to a repeat maker.
+
+Sample, BTC, 600 s, 655 fills → 357 orders, $3.3M: notional-weighted 1 s markout +0.34 bps against a half-spread of +0.10 bps, so makers' realised spread was −0.24 bps per dollar before fees. One address was informed at t = 3.1 with preCEX +1.0 bps: it hit HL after the CEX composite had already moved 1 bps in its direction. Fills in the last 5 s of a window cannot be marked out and are dropped, not zero-filled.
+
+### k-means toggle
+
+`--kmeans K` replaces the rule with k-means over each address's profile: mean markout at 100 ms / 1 s / 5 s, half-spread paid, pre-fill CEX move, TWAP share. Features are z-scored, seeding is k-means++, best of 10 restarts, deterministic. Clusters are numbered by centroid 1 s markout so `k0` is always the least informed; the centroid table is printed and is how you read them. `--kmeans 0` (default) is the rule.
+
+The two answer different questions. The rule is a falsifiable statement per address ("this taker's 1 s markout is positive at t > 2"). K-means partitions whatever structure is there, whether or not it matches the names you had in mind, and a cluster with three members is not evidence of anything. Use the rule to make claims and k-means to look for classes the rule does not have.
