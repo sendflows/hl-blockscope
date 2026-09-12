@@ -59,3 +59,28 @@ Validator names come from the info endpoint (`validatorSummaries`), matched on t
 - EVM block timestamps are whole seconds. Sub-second EVM cadence is not observable from the public RPC.
 - `sys` counts system transactions but does not decode which token was bridged.
 - Mainnet only. Change the three endpoint constants at the top of `main.rs` for testnet.
+
+## regulator: execution quality vs CEX
+
+Second binary. Benchmarks every HyperCore perp fill against Binance, Bybit and OKX USDT perps, and measures how often HL's mid is mispriced against them.
+
+```
+cargo run --release --bin regulator -- --coin BTC --secs 120 --csv fills.csv
+```
+
+Flags: `--coin` (BTC, ETH, SOL, HYPE...), `--secs` window, `--hl-fee-bps` (default 7.0, tier-0 taker), `--cex-fee-bps` (default 2.0, roughly VIP taker), `--csv` per-fill output.
+
+Each fill's cost against the CEX mid is split into two parts, because they mean different things:
+
+| part | clocks | meaning |
+|---|---|---|
+| effective half-spread | HL only | what the taker paid relative to HL's own mid. Execution quality. |
+| basis | HL vs CEX | HL mid minus CEX composite mid, signed by side. A level difference between USDC and USDT perps, not execution. |
+
+The mispricing clock reports the fraction of time HL's mid sits more than 1, 2, 5 bps from the CEX composite, raw and net of a 30s rolling-median basis. The adjusted column is the latency-mispricing figure; the raw one is dominated by the basis.
+
+How the reference is built: for a fill at HL time T, take each venue's latest quote with `exch_ts <= T`, composite mid = median of venue mids, CEX spread = tightest single-venue spread. A max-bid/min-ask composite across venues crosses itself when quotes are a few ms apart and produces negative spreads, so it is not used.
+
+This is a cross-clock join. It holds only while the venues' clocks agree. The tool prints `recv_wall - exch_ts` per feed as evidence; if those drift apart, the reference is wrong. The effective half-spread is HL-vs-HL and does not depend on it.
+
+Sample, BTC, 120s: effective half-spread p50 0.06 bps, CEX tightest half-spread 0.01 bps, HL mid within 1 bps of CEX 98.7% of the time after basis adjustment (mean 0.14 bps). Beat rate on all-in cost is 0% at tier-0 fees: 7 bps taker on HL vs ~2 bps on a CEX VIP tier. The spread is a wash; the fee is the whole difference.
